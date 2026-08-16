@@ -70,6 +70,7 @@ async def start_single_userbot(user_id: int, session_string: str) -> Client:
     await ub.start()
     active_userbots[user_id] = ub
     _register_userbot_handler(ub, user_id)
+    _register_userbot_private_handler(ub, user_id)
 
     me = await ub.get_me()
     logger.info(f"✅ Userbot started: user_id={user_id} → @{me.username} ({me.first_name})")
@@ -112,6 +113,39 @@ def _register_userbot_handler(ub: Client, user_id: int):
             logger.exception(f"Userbot handler error for user {user_id}")
 
     logger.info(f"✅ Userbot handler registered for user_id={user_id}")
+
+
+def _register_userbot_private_handler(ub: Client, user_id: int):
+    """
+    ✅ NEW: source ek bot/user ki PRIVATE chat bhi ho sakta hai — jaise
+    "Save Restricted Content" jaisa koi bot jo tumhe PM mein files bhejta
+    hai. Yeh sirf userbot pe register hota hai (bot client kisi aur ki PM
+    nahi dekh sakta) aur sirf isi user ki OWN DMs sunta hai.
+    """
+    @ub.on_message(
+        filters.private &
+        (filters.video | filters.document | filters.photo |
+         filters.audio | filters.animation | filters.text |
+         filters.sticker | filters.voice | filters.video_note |
+         filters.poll | filters.location | filters.contact)
+    )
+    async def userbot_private_forward_content(client, message):
+        try:
+            if message.outgoing:
+                # ✅ khud (userbot) ka bheja hua message ignore karo
+                return
+            real_cid = message.chat.id
+            # ✅ NEW: user-scoped key — taaki agar 2 alag users same bot
+            # (jaise same "Save Restricted Content") ko source banayein,
+            # ek dusre ki personal DM cross-forward na ho.
+            key = f"priv:{user_id}:{real_cid}"
+            if _is_duplicate(key, message.id):
+                return
+            _handle_incoming_message(key, message, source_client=client)
+        except Exception:
+            logger.exception(f"Userbot private handler error for user {user_id}")
+
+    logger.info(f"✅ Userbot private (DM) handler registered for user_id={user_id}")
 
 
 async def restore_all_userbots():
@@ -487,7 +521,25 @@ async def process_buffered_messages(source_chat_id, source_client=None):
     Jab BUFFER_DELAY seconds tak koi naya message na aaye
     tabhi saare collected messages forward karo.
     Isse bulk messages mein koi bhi skip nahi hoga.
+
+    ✅ NEW: source_chat_id ek plain int (channel/supergroup, multi-tenant —
+    kai users same channel ko source bana sakte hain) YA ek scoped string
+    "priv:<user_id>:<real_chat_id>" ho sakta hai (private/bot source, jaise
+    "Save Restricted Content" bot). Scoped string ka matlab: sirf USI user
+    ki mapping process hogi — warna agar 2 alag users same bot ko source
+    banate, toh ek ki personal DM dusre ke target mein leak ho sakti thi.
     """
+    real_source_id = source_chat_id
+    scoped_user_id = None
+    if isinstance(source_chat_id, str) and source_chat_id.startswith("priv:"):
+        try:
+            _, uid_str, real_id_str = source_chat_id.split(":", 2)
+            scoped_user_id = int(uid_str)
+            real_source_id = int(real_id_str)
+        except Exception:
+            logger.exception(f"Bad private source key: {source_chat_id}")
+            return
+
     try:
         while True:
             await asyncio.sleep(BUFFER_DELAY)
@@ -515,17 +567,21 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                 unique_messages.append(m)
         messages = unique_messages
 
-        logger.info(f"Processing {len(messages)} buffered msgs from {source_chat_id}")
+        logger.info(f"Processing {len(messages)} buffered msgs from {real_source_id}")
 
-        source_title = str(source_chat_id)
+        source_title = str(real_source_id)
         try:
             if source_client:
-                chat = await source_client.get_chat(source_chat_id)
-                source_title = chat.title or source_title
+                chat = await source_client.get_chat(real_source_id)
+                source_title = chat.title or chat.first_name or source_title
         except Exception:
             pass
 
-        mappings = await database.get_all_targets_for_source(source_chat_id)
+        mappings = await database.get_all_targets_for_source(real_source_id)
+        if scoped_user_id is not None:
+            # ✅ NEW: private source — sirf usi user ki mapping, baaki ignore
+            mappings = [m for m in mappings if m.get("user_id") == scoped_user_id]
+
         for mapping in mappings:
             targets = mapping.get("target_ids", [])
             user_id = mapping.get("user_id")
@@ -581,7 +637,7 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                     sender = ub
 
             source_info = {
-                "id": source_chat_id,
+                "id": real_source_id,
                 "title": source_title,
                 "user_id": user_id,
                 "delay": msg_delay,
@@ -593,7 +649,7 @@ async def process_buffered_messages(source_chat_id, source_client=None):
             }
 
             await message_queue.put((messages_to_send.copy(), targets, "buffered", 0, sender, source_info))
-            logger.info(f"Queued {len(messages_to_send)} msgs from {source_chat_id} -> {len(targets)} targets")
+            logger.info(f"Queued {len(messages_to_send)} msgs from {real_source_id} -> {len(targets)} targets")
 
     except asyncio.CancelledError:
         # Messages buffer mein safe hain — lost nahi honge
