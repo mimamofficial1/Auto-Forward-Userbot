@@ -222,6 +222,46 @@ async def smart_get_chat(client, chat_id, user_id):
     return await client.get_chat(chat_id)
 
 
+class InvalidChannelError(Exception):
+    """✅ NEW: jab /set ya mapping_set mein diya gaya ID channel/supergroup (ya source ke liye bot/private chat) na ho."""
+    pass
+
+def _ensure_is_channel(chat, allow_private_source: bool = False):
+    """
+    ✅ FIX: forwarding channel/supergroup se hoti hai. Agar koi user ID
+    ya bot ID galti se (bina -100 prefix ke) daal de, toh Telegram usse ek
+    USER chat resolve kar deta hai — pehle bina kisi warning ke mapping save
+    ho jaati thi, aur woh source hamesha silently forward fail karta tha
+    (title bhi "None" dikhta tha /list mein). Ab yeh explicitly reject hoga.
+
+    ✅ NEW: SOURCE ke liye ek exception hai — agar allow_private_source=True
+    hai (jaise "Save Restricted Content" jaisa koi bot jo tumhe PM mein files
+    bhejta hai), toh PRIVATE chat (bot/user) ko bhi valid source maana
+    jaayega, kyunki userbot apni khud ki DMs se forward kar sakta hai.
+    TARGET hamesha channel/supergroup hi rehta hai — private chat mein
+    "bhejna" is bot ka use-case nahi hai.
+    """
+    allowed = (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP)
+    if allow_private_source:
+        allowed = allowed + (enums.ChatType.PRIVATE, enums.ChatType.BOT)
+    if chat.type not in allowed:
+        raise InvalidChannelError(
+            f"<code>{chat.id}</code> is type ka nahi hai jo yahan chalega (type: <code>{chat.type.name}</code>).\n\n"
+            f"Channel ID hamesha <code>-100</code> se start hoti hai — jaise <code>-1001234567890</code>. "
+            f"Ya phir channel/bot ka @username bhejo."
+        )
+    return chat
+
+
+def _display_name(chat) -> str:
+    """
+    ✅ NEW: channel ka 'title' hota hai, lekin bot/user (private source) ka
+    nahi — unke paas first_name/username hota hai. Isse "None" dikhna band
+    ho jaata hai jab source ek bot/user ho (jaise "Save Restricted Content").
+    """
+    return chat.title or chat.first_name or (f"@{chat.username}" if chat.username else str(chat.id))
+
+
 # ==================== START / HELP / ABOUT ====================
 
 @Client.on_message(filters.command("start") & filters.private)
@@ -837,31 +877,36 @@ async def set_channels(client, message: Message):
     user_id = message.from_user.id
     if len(message.command) < 3:
         return await message.reply_text(
-            "<b>❌ Usage:</b> <code>/set &lt;source_id&gt; &lt;target_id&gt;</code>",
+            "<b>❌ Usage:</b> <code>/set &lt;source_id&gt; &lt;target_id&gt;</code>\n\n"
+            "<i>Source: channel/supergroup ya koi bot bhi ho sakta hai (jaise koi bot jo tumhe PM mein files bhejta hai) — "
+            "isके liye /login zaroori hai. Target hamesha channel/supergroup hi hona chahiye.</i>",
             parse_mode=enums.ParseMode.HTML
         )
     proc_msg = await message.reply_text("⏳ Processing...")
     try:
-        source_chat = await smart_get_chat(client, message.command[1], user_id)
-        target_chat = await smart_get_chat(client, message.command[2], user_id)
+        source_chat = _ensure_is_channel(await smart_get_chat(client, message.command[1], user_id), allow_private_source=True)
+        target_chat = _ensure_is_channel(await smart_get_chat(client, message.command[2], user_id))
         result = await database.add_target_to_source(
-            user_id, source_chat.id, target_chat.id, source_chat.title, target_chat.title
+            user_id, source_chat.id, target_chat.id, _display_name(source_chat), _display_name(target_chat)
         )
         await proc_msg.delete()
         if result in ("created", "added"):
             action = "New Source Created" if result == "created" else "Target Added"
             await message.reply_text(
                 f"<b>✅ {action}:</b>\n\n"
-                f"📥 Source: {source_chat.title}\n   <code>{source_chat.id}</code>\n\n"
-                f"📤 Target: {target_chat.title}\n   <code>{target_chat.id}</code>\n\n"
+                f"📥 Source: {_display_name(source_chat)}\n   <code>{source_chat.id}</code>\n\n"
+                f"📤 Target: {_display_name(target_chat)}\n   <code>{target_chat.id}</code>\n\n"
                 f"🎉 Messages Will Be Forwarded!",
                 parse_mode=enums.ParseMode.HTML
             )
             await log_source_added(client, message.from_user,
-                                   source_chat.title, source_chat.id,
-                                   target_chat.title, target_chat.id)
+                                   _display_name(source_chat), source_chat.id,
+                                   _display_name(target_chat), target_chat.id)
         else:
             await message.reply_text("<b>⚠️ Already Exists!</b>", parse_mode=enums.ParseMode.HTML)
+    except InvalidChannelError as e:
+        await proc_msg.delete()
+        await message.reply_text(f"<b>❌ Invalid Channel:</b>\n\n{e}", parse_mode=enums.ParseMode.HTML)
     except PeerIdInvalid:
         await proc_msg.delete()
         await message.reply_text(
@@ -891,13 +936,13 @@ async def remove_target_channel(client, message: Message):
         if result == "removed":
             await message.reply_text(
                 f"✅ <b>Target Removed!</b>\n\n"
-                f"📥 {source_chat.title} (<code>{source_chat.id}</code>)\n"
-                f"🗑️ {target_chat.title} (<code>{target_chat.id}</code>)",
+                f"📥 {_display_name(source_chat)} (<code>{source_chat.id}</code>)\n"
+                f"🗑️ {_display_name(target_chat)} (<code>{target_chat.id}</code>)",
                 parse_mode=enums.ParseMode.HTML
             )
             await log_target_removed(client, message.from_user,
-                                     source_chat.title, source_chat.id,
-                                     target_chat.title, target_chat.id)
+                                     _display_name(source_chat), source_chat.id,
+                                     _display_name(target_chat), target_chat.id)
         else:
             await message.reply_text("<b>⚠️ Not Found.</b>", parse_mode=enums.ParseMode.HTML)
     except Exception as e:
@@ -916,10 +961,10 @@ async def remove_channel(client, message: Message):
         removed = await database.remove_source(user_id, chat.id)
         if removed:
             await message.reply_text(
-                f"✅ <b>Removed:</b> {chat.title} (<code>{chat.id}</code>)",
+                f"✅ <b>Removed:</b> {_display_name(chat)} (<code>{chat.id}</code>)",
                 parse_mode=enums.ParseMode.HTML
             )
-            await log_source_removed(client, message.from_user, chat.title, chat.id)
+            await log_source_removed(client, message.from_user, _display_name(chat), chat.id)
         else:
             await message.reply_text(f"⚠️ Not found.", parse_mode=enums.ParseMode.HTML)
     except Exception as e:
@@ -940,11 +985,11 @@ async def list_mappings(client, message: Message):
         target_ids = mapping.get('target_ids', [])
         try:
             sc = await smart_get_chat(client, source_id, user_id)
-            text += f"<b>{idx}. 📥 {sc.title}</b>\n   <code>{source_id}</code>\n   ⤵️ Targets ({len(target_ids)}):\n"
+            text += f"<b>{idx}. 📥 {_display_name(sc)}</b>\n   <code>{source_id}</code>\n   ⤵️ Targets ({len(target_ids)}):\n"
             for tid in target_ids:
                 try:
                     tc = await smart_get_chat(client, tid, user_id)
-                    text += f"   • {tc.title} (<code>{tid}</code>)\n"
+                    text += f"   • {_display_name(tc)} (<code>{tid}</code>)\n"
                 except:
                     text += f"   • <code>{tid}</code>\n"
             text += "\n"
@@ -1332,7 +1377,7 @@ INPUT_PROMPTS = {
     "replace_rem":        "🗑️ <b>'Old' word bhejo</b> jiska rule remove karna hai:",
     "remword_add":        "➕ <b>Word(s) bhejo</b> jo remove-list mein add karne hain (<code>|</code> se separate):",
     "remword_rem":        "🗑️ <b>Word(s) bhejo</b> jo remove-list se hatane hain:",
-    "mapping_set":        "➕ <b>Source aur Target channel ID/username bhejo</b>, space se separate:\n\n<i>Example: -1001234567890 -1009876543210</i>",
+    "mapping_set":        "➕ <b>Source aur Target ID/username bhejo</b>, space se separate:\n\n<i>Example: -1001234567890 -1009876543210\n\nSource koi bot bhi ho sakta hai (jaise 'Save Restricted Content' — PM mein files bhejta hai), Target hamesha channel/supergroup hona chahiye.</i>",
     "mapping_remtarget":  "🗑️ <b>Source aur Target ID bhejo</b> (space se separate) jise mapping se hatana hai:",
     "mapping_remsource":  "🗑️ <b>Source channel ID bhejo</b> jise poori tarah remove karna hai:",
     "admin_add":          "➕ <b>User ID bhejo</b> jise admin banana hai:",
@@ -1779,12 +1824,15 @@ async def settings_menu_input_handler(client, message: Message):
             if len(parts) != 2:
                 msg = "❌ Format galat. Example: <code>-1001234567890 -1009876543210</code>"
             else:
-                src_chat = await smart_get_chat(client, parts[0], user_id)
-                tgt_chat = await smart_get_chat(client, parts[1], user_id)
-                result = await database.add_target_to_source(
-                    user_id, src_chat.id, tgt_chat.id, src_chat.title, tgt_chat.title
-                )
-                msg = "✅ Mapping set!" if result in ("created", "added") else "⚠️ Already exists!"
+                try:
+                    src_chat = _ensure_is_channel(await smart_get_chat(client, parts[0], user_id), allow_private_source=True)
+                    tgt_chat = _ensure_is_channel(await smart_get_chat(client, parts[1], user_id))
+                    result = await database.add_target_to_source(
+                        user_id, src_chat.id, tgt_chat.id, _display_name(src_chat), _display_name(tgt_chat)
+                    )
+                    msg = "✅ Mapping set!" if result in ("created", "added") else "⚠️ Already exists!"
+                except InvalidChannelError as e:
+                    msg = f"❌ Invalid Channel: {e}"
 
         elif action == "mapping_remtarget":
             parts = raw.split()
