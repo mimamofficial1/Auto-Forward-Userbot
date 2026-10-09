@@ -13,6 +13,7 @@ from pyrogram.errors import (
     SessionPasswordNeeded, PasswordHashInvalid, PeerIdInvalid,
 )
 import config as cfg
+from SilentXForward.cover_copy import copy_keep_cover
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -995,7 +996,7 @@ async def cmd_broadcast(client, message: Message):
     for uid in user_ids:
         try:
             if message.reply_to_message:
-                await message.reply_to_message.copy(uid)
+                await copy_keep_cover(message.reply_to_message, uid)
             else:
                 text = message.text.split(None, 1)[1]
                 await client.send_message(uid, text, parse_mode=enums.ParseMode.HTML)

@@ -5,6 +5,7 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError, ChannelInvalid, ChannelPrivate, ChatAdminRequired, PeerIdInvalid
 from SilentXForward import database
 from SilentXForward import caption as caption_engine
+from SilentXForward.cover_copy import has_cover, copy_with_cover, COVER_SUPPORTED
 import config as cfg
 
 # ================= CONFIG =================
@@ -208,6 +209,34 @@ async def _ensure_peer_resolved(writer, chat_id: int) -> bool:
         return False
 
 
+# ================= COPY (keeps the video cover) =================
+async def _copy_keep_cover(writer, chat_id, from_chat_id, message_id, src=None, caption=None):
+    """Drop-in for writer.copy_message(...).
+
+    copy_message re-sends a video by file_id and silently DROPS its Telegram
+    cover. A video that carries a cover is therefore sent through
+    copy_with_cover instead. Every other message (and every failure of the
+    cover path) goes through the normal copy_message, exactly as before.
+    """
+    if src is not None and has_cover(src):
+        try:
+            # file_ids only work for the account that fetched the message
+            fetched = src if getattr(src, "_client", None) is writer \
+                else await writer.get_messages(from_chat_id, message_id)
+            if has_cover(fetched):
+                sent = await copy_with_cover(fetched, chat_id, caption=caption)
+                if sent is not None:
+                    return sent
+        except (FloodWait, ChannelInvalid, ChannelPrivate, ChatAdminRequired, PeerIdInvalid):
+            raise  # handled by handle_flood / the callers, same as copy_message errors
+        except Exception as e:
+            logger.warning(f"[COVER] cover copy failed, forwarding without cover: {type(e).__name__}: {e}")
+    kwargs = dict(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
+    if caption is not None:
+        kwargs["caption"] = caption
+    return await writer.copy_message(**kwargs)
+
+
 # ================= SINGLE FORWARD =================
 async def forward_single_message(client, message, chat_id, sender_client=None, caption_settings: dict = None):
     writer = sender_client if sender_client else client
@@ -252,18 +281,22 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
 
         if final_caption:
             await handle_flood(
-                writer.copy_message,
+                _copy_keep_cover,
+                writer=writer,
                 chat_id=chat_id,
                 from_chat_id=message.chat.id,
                 message_id=message.id,
+                src=message,
                 caption=final_caption,
             )
         else:
             await handle_flood(
-                writer.copy_message,
+                _copy_keep_cover,
+                writer=writer,
                 chat_id=chat_id,
                 from_chat_id=message.chat.id,
                 message_id=message.id,
+                src=message,
             )
         _invalid_target_strikes.pop(chat_id, None)
         return True
@@ -284,10 +317,12 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
         if sender_client and sender_client != client:
             try:
                 await handle_flood(
-                    client.copy_message,
+                    _copy_keep_cover,
+                    writer=client,
                     chat_id=chat_id,
                     from_chat_id=message.chat.id,
                     message_id=message.id,
+                    src=message,
                 )
                 _invalid_target_strikes.pop(chat_id, None)
                 return True
@@ -314,10 +349,12 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
         if sender_client and sender_client != client:
             try:
                 await handle_flood(
-                    client.copy_message,
+                    _copy_keep_cover,
+                    writer=client,
                     chat_id=chat_id,
                     from_chat_id=message.chat.id,
                     message_id=message.id,
+                    src=message,
                 )
                 return True
             except Exception:
@@ -464,6 +501,9 @@ async def start_forwarder(client):
     _bot_client = client
     if getattr(client, "_queue_tasks", None):
         return
+    import pyrogram
+    logger.info(f"Pyrofork {pyrogram.__version__} | keep video cover: "
+                f"{'YES' if COVER_SUPPORTED else 'NO (needs pyrofork>=2.3.60)'}")
     await restore_all_userbots()
     client._queue_tasks = await start_processor(client)
 
