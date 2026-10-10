@@ -14,6 +14,7 @@ from pyrogram.errors import (
 )
 import config as cfg
 from SilentXForward.cover_copy import copy_keep_cover
+from SilentXForward.forward import chat_display_name
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -846,21 +847,21 @@ async def set_channels(client, message: Message):
         source_chat = await smart_get_chat(client, message.command[1], user_id)
         target_chat = await smart_get_chat(client, message.command[2], user_id)
         result = await database.add_target_to_source(
-            user_id, source_chat.id, target_chat.id, source_chat.title, target_chat.title
+            user_id, source_chat.id, target_chat.id, chat_display_name(source_chat), chat_display_name(target_chat)
         )
         await proc_msg.delete()
         if result in ("created", "added"):
             action = "New Source Created" if result == "created" else "Target Added"
             await message.reply_text(
                 f"<b>✅ {action}:</b>\n\n"
-                f"📥 Source: {source_chat.title}\n   <code>{source_chat.id}</code>\n\n"
-                f"📤 Target: {target_chat.title}\n   <code>{target_chat.id}</code>\n\n"
+                f"📥 Source: {chat_display_name(source_chat)}\n   <code>{source_chat.id}</code>\n\n"
+                f"📤 Target: {chat_display_name(target_chat)}\n   <code>{target_chat.id}</code>\n\n"
                 f"🎉 Messages Will Be Forwarded!",
                 parse_mode=enums.ParseMode.HTML
             )
             await log_source_added(client, message.from_user,
-                                   source_chat.title, source_chat.id,
-                                   target_chat.title, target_chat.id)
+                                   chat_display_name(source_chat), source_chat.id,
+                                   chat_display_name(target_chat), target_chat.id)
         else:
             await message.reply_text("<b>⚠️ Already Exists!</b>", parse_mode=enums.ParseMode.HTML)
     except PeerIdInvalid:
@@ -892,13 +893,13 @@ async def remove_target_channel(client, message: Message):
         if result == "removed":
             await message.reply_text(
                 f"✅ <b>Target Removed!</b>\n\n"
-                f"📥 {source_chat.title} (<code>{source_chat.id}</code>)\n"
-                f"🗑️ {target_chat.title} (<code>{target_chat.id}</code>)",
+                f"📥 {chat_display_name(source_chat)} (<code>{source_chat.id}</code>)\n"
+                f"🗑️ {chat_display_name(target_chat)} (<code>{target_chat.id}</code>)",
                 parse_mode=enums.ParseMode.HTML
             )
             await log_target_removed(client, message.from_user,
-                                     source_chat.title, source_chat.id,
-                                     target_chat.title, target_chat.id)
+                                     chat_display_name(source_chat), source_chat.id,
+                                     chat_display_name(target_chat), target_chat.id)
         else:
             await message.reply_text("<b>⚠️ Not Found.</b>", parse_mode=enums.ParseMode.HTML)
     except Exception as e:
@@ -941,7 +942,7 @@ async def list_mappings(client, message: Message):
         target_ids = mapping.get('target_ids', [])
         try:
             sc = await smart_get_chat(client, source_id, user_id)
-            text += f"<b>{idx}. 📥 {sc.title}</b>\n   <code>{source_id}</code>\n   ⤵️ Targets ({len(target_ids)}):\n"
+            text += f"<b>{idx}. 📥 {chat_display_name(sc)}</b>\n   <code>{source_id}</code>\n   ⤵️ Targets ({len(target_ids)}):\n"
             for tid in target_ids:
                 try:
                     tc = await smart_get_chat(client, tid, user_id)
@@ -1783,7 +1784,7 @@ async def settings_menu_input_handler(client, message: Message):
                 src_chat = await smart_get_chat(client, parts[0], user_id)
                 tgt_chat = await smart_get_chat(client, parts[1], user_id)
                 result = await database.add_target_to_source(
-                    user_id, src_chat.id, tgt_chat.id, src_chat.title, tgt_chat.title
+                    user_id, src_chat.id, tgt_chat.id, chat_display_name(src_chat), chat_display_name(tgt_chat)
                 )
                 msg = "✅ Mapping set!" if result in ("created", "added") else "⚠️ Already exists!"
 

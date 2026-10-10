@@ -43,6 +43,36 @@ _bot_client = None
 active_userbots: dict[int, Client] = {}
 
 
+# ✅ NEW: private chats ke liye — har incoming PM pe DB query na ho, isliye chhota cache.
+_PRIVATE_SOURCE_TTL = 10  # seconds (/set ke baad max itni der mein naya source pakad liya jaata hai)
+_private_source_cache: dict[int, tuple[float, bool]] = {}
+
+
+async def _is_private_source(chat_id: int) -> bool:
+    now = asyncio.get_event_loop().time()
+    hit = _private_source_cache.get(chat_id)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        is_source = bool(await database.get_all_targets_for_source(chat_id))
+    except Exception:
+        logger.exception(f"Source lookup failed for private chat {chat_id}")
+        return False
+    _private_source_cache[chat_id] = (now + _PRIVATE_SOURCE_TTL, is_source)
+    if len(_private_source_cache) > 2000:
+        _private_source_cache.clear()
+    return is_source
+
+
+def chat_display_name(chat) -> str:
+    """Channels/groups have a title; a private chat (e.g. a bot) only has a name."""
+    title = getattr(chat, "title", None)
+    if title:
+        return title
+    name = " ".join(x for x in (getattr(chat, "first_name", None), getattr(chat, "last_name", None)) if x)
+    return name or getattr(chat, "username", None) or str(getattr(chat, "id", ""))
+
+
 def _is_duplicate(chat_id: int, message_id: int) -> bool:
     if message_id in seen_message_ids[chat_id]:
         return True
@@ -111,6 +141,28 @@ def _register_userbot_handler(ub: Client, user_id: int):
             _handle_incoming_message(cid, message, source_client=client)
         except Exception:
             logger.exception(f"Userbot handler error for user {user_id}")
+
+    # ✅ NEW: private chats — e.g. another bot's PM with this account. Only
+    # INCOMING messages (what the bot sends you, not what you type to it), and
+    # only from chats that are actually set as a source, so the rest of your
+    # private chats are ignored without being buffered.
+    @ub.on_message(
+        filters.private & filters.incoming &
+        (filters.video | filters.document | filters.photo |
+         filters.audio | filters.animation | filters.text |
+         filters.sticker | filters.voice | filters.video_note |
+         filters.poll | filters.location | filters.contact)
+    )
+    async def userbot_forward_private(client, message):
+        try:
+            cid = message.chat.id
+            if not await _is_private_source(cid):
+                return
+            if _is_duplicate(cid, message.id):
+                return
+            _handle_incoming_message(cid, message, source_client=client)
+        except Exception:
+            logger.exception(f"Userbot private handler error for user {user_id}")
 
     logger.info(f"✅ Userbot handler registered for user_id={user_id}")
 
@@ -561,7 +613,7 @@ async def process_buffered_messages(source_chat_id, source_client=None):
         try:
             if source_client:
                 chat = await source_client.get_chat(source_chat_id)
-                source_title = chat.title or source_title
+                source_title = chat_display_name(chat)
         except Exception:
             pass
 
