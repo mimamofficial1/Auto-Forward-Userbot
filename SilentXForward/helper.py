@@ -268,13 +268,15 @@ async def about_command(client, message):
 @Client.on_message(filters.command("off") & filters.private)
 async def cmd_off(client, message: Message):
     await database.set_forwarding(message.from_user.id, False)
-    await message.reply_text("⏸️ <b>Forwarding paused!</b>\n\nResume karne ke liye /on ya /resume use karo.",
+    label = await _scope_label(client, message.from_user.id)
+    await message.reply_text(f"⏸️ <b>Forwarding paused!</b>\n📍 {label}\n\nResume karne ke liye /on ya /resume use karo.",
                              parse_mode=enums.ParseMode.HTML)
 
 @Client.on_message(filters.command(["on", "resume"]) & filters.private)
 async def cmd_on(client, message: Message):
     await database.set_forwarding(message.from_user.id, True)
-    await message.reply_text("▶️ <b>Forwarding resumed!</b>\n\nMessages ab forward honge.",
+    label = await _scope_label(client, message.from_user.id)
+    await message.reply_text(f"▶️ <b>Forwarding resumed!</b>\n📍 {label}\n\nMessages ab forward honge.",
                              parse_mode=enums.ParseMode.HTML)
 
 
@@ -296,8 +298,10 @@ async def _build_status_text(user_id: int) -> str:
     ub = active_userbots.get(user_id)
     session_status = "🟢 Active" if (ub and ub.is_connected) else "🔴 Not logged in"
 
+    scope_label = await _scope_label(None, user_id)
     return (
         f"<b>📊 Status Dashboard</b>\n\n"
+        f"📍 Settings for: {scope_label}\n"
         f"👤 Session: {session_status}\n"
         f"📡 Forwarding: {'▶️ ON' if fwd_on else '⏸️ OFF'}\n"
         f"⏱️ Delay: <code>{delay}s</code>\n"
@@ -727,7 +731,8 @@ async def cb_cancel_reset(client, callback_query):
         return await callback_query.answer("🚫 Yeh button aapke liye nahi hai!", show_alert=True)
 
     await callback_query.answer("❌ Reset cancel kar diya.")
-    await callback_query.message.edit_text(MENU_HEADER, parse_mode=enums.ParseMode.HTML, reply_markup=_menu_main_markup())
+    text, kb = await _main_menu(client, callback_query.from_user.id)
+    await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
 
 # ==================== STATS ====================
@@ -1363,6 +1368,90 @@ def _menu_main_markup() -> InlineKeyboardMarkup:
          InlineKeyboardButton(_sc("❌ Close"), callback_data="menu:close")],
     ])
 
+# ==================== PER-CHANNEL SETTINGS (scope) ====================
+# /settings -> pehle channel chuno (ya "All Channels"), phir jo bhi settings badlo
+# (menu ya commands) sirf usi channel pe lagengi. Baaki channels default use karte hain.
+
+_title_cache: dict = {}
+_SCOPE_PAGE = 20
+GLOBAL_LABEL = "🌐 All Channels (Default)"
+
+
+async def _target_names(client, user_id: int, ids: list) -> dict:
+    """channel id -> naam. Pehle DB mein saved naam, phir live lookup (userbot ya bot), warna 'Channel <id>'."""
+    saved = dict(await database.get_user_targets(user_id))
+    out = {}
+    for t in ids:
+        name = saved.get(t) or _title_cache.get(t)
+        if not name and client is not None:
+            try:
+                from SilentXForward.forward import active_userbots
+                ub = active_userbots.get(user_id)
+                getter = ub if (ub and ub.is_connected) else client
+                name = chat_display_name(await getter.get_chat(t))
+            except Exception:
+                name = None
+        out[t] = name or f"Channel {t}"
+        _title_cache[t] = out[t]
+    return out
+
+
+async def _scope_label(client, user_id: int) -> str:
+    tid = database.get_scope(user_id)
+    if tid is None:
+        return GLOBAL_LABEL
+    return "📺 " + (await _target_names(client, user_id, [tid]))[tid]
+
+
+async def _render_scope_picker(client, user_id: int, page: int = 0):
+    targets = await database.get_user_targets(user_id)
+    own = await database.get_override_targets(user_id)
+    names = await _target_names(client, user_id, [t for t, _ in targets])
+    current = database.get_scope(user_id)
+    rows = [[InlineKeyboardButton(("✅ " if current is None else "") + GLOBAL_LABEL, callback_data="scope:all")]]
+    pages = max(1, -(-len(targets) // _SCOPE_PAGE))
+    page = max(0, min(page, pages - 1))
+    for t, _ in targets[page * _SCOPE_PAGE:(page + 1) * _SCOPE_PAGE]:
+        mark = ("✅ " if t == current else "") + ("✏️ " if t in own else "")
+        rows.append([InlineKeyboardButton(f"{mark}{names[t]}"[:60], callback_data=f"scope:{t}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"scope:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="scope:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"scope:page:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(_sc("❌ Close"), callback_data="menu:close")])
+    text = (
+        "<b>📺 Channel Settings</b>\n\n"
+        "Kis channel ki settings badalni hain? 👇\n\n"
+        f"• <b>{GLOBAL_LABEL}</b> — default settings. Jis channel ki alag setting nahi hai wo yehi use karta hai.\n"
+        "• <b>Koi channel</b> chuno — uski caption, footer, filters, replace-words, delay sab <b>alag</b> hongi, "
+        "baaki channels par koi asar nahi.\n"
+        "• ✏️ = us channel ki apni alag settings hain.\n"
+        "• ✅ = abhi yehi chuna hua hai."
+    )
+    if not targets:
+        text += "\n\n<i>Abhi koi target channel set nahi hai. Pehle /set se source aur target jodo.</i>"
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _menu_header(client, user_id: int) -> str:
+    label = await _scope_label(client, user_id)
+    return f"{MENU_HEADER}\n📍 <b>Editing:</b> {label}"
+
+
+async def _main_menu(client, user_id: int):
+    """(text, markup) of the main settings menu, with the current channel shown on top."""
+    text = await _menu_header(client, user_id)
+    kb = _menu_main_markup()
+    rows = [[InlineKeyboardButton(_sc("🔀 Change Channel"), callback_data="scope:pick")]]
+    if database.get_scope(user_id) is not None:
+        rows.append([InlineKeyboardButton(_sc("♻️ Reset This Channel To Default"), callback_data="scope:reset")])
+    return text, InlineKeyboardMarkup(rows + kb.inline_keyboard)
+
+
 def _back_menu_button(target: str = "main") -> list:
     return [InlineKeyboardButton(_sc("🔙 Back to Menu"), callback_data=f"menu:{target}")]
 
@@ -1535,7 +1624,13 @@ _MENU_RENDERERS = {
 
 @Client.on_message(filters.command(["settings", "manage"]) & filters.private)
 async def cmd_settings_menu(client, message: Message):
-    await message.reply_text(MENU_HEADER, parse_mode=enums.ParseMode.HTML, reply_markup=_menu_main_markup())
+    user_id = message.from_user.id
+    database.set_scope(user_id, None)  # har /settings naye sire se: pehle channel chuno
+    if await database.get_user_targets(user_id):
+        text, kb = await _render_scope_picker(client, user_id)
+    else:
+        text, kb = await _main_menu(client, user_id)
+    await message.reply_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
 @Client.on_message(filters.command("customfilters") & filters.private)
 async def cmd_customfilters(client, message: Message):
@@ -1550,7 +1645,8 @@ async def cb_menu_router(client, callback_query):
 
     if key == "main":
         await callback_query.answer()
-        return await callback_query.message.edit_text(MENU_HEADER, parse_mode=enums.ParseMode.HTML, reply_markup=_menu_main_markup())
+        text, kb = await _main_menu(client, user_id)
+        return await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
     if key == "back":
         await callback_query.answer()
@@ -1568,7 +1664,8 @@ async def cb_menu_router(client, callback_query):
         enabled = await database.is_forwarding_enabled(user_id)
         await database.set_forwarding(user_id, not enabled)
         await callback_query.answer("▶️ Forwarding Resumed!" if not enabled else "⏸️ Forwarding Paused!")
-        return await callback_query.message.edit_text(MENU_HEADER, parse_mode=enums.ParseMode.HTML, reply_markup=_menu_main_markup())
+        text, kb = await _main_menu(client, user_id)
+        return await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
     if key == "reset":
         await callback_query.answer()
@@ -1589,6 +1686,43 @@ async def cb_menu_router(client, callback_query):
         return await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
     await callback_query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^scope:(.+)$"))
+async def cb_scope(client, callback_query):
+    user_id = callback_query.from_user.id
+    arg = callback_query.matches[0].group(1)
+    edit = lambda t, k: callback_query.message.edit_text(t, parse_mode=enums.ParseMode.HTML, reply_markup=k)
+
+    if arg == "noop":
+        return await callback_query.answer()
+    if arg == "pick":
+        await callback_query.answer()
+        return await edit(*await _render_scope_picker(client, user_id))
+    if arg.startswith("page:"):
+        await callback_query.answer()
+        return await edit(*await _render_scope_picker(client, user_id, int(arg.split(":", 1)[1])))
+    if arg == "reset":
+        tid = database.get_scope(user_id)
+        if tid is None:
+            return await callback_query.answer("Pehle koi channel chuno.", show_alert=True)
+        await database.reset_scope(user_id, tid)
+        await callback_query.answer("♻️ Is channel ki settings default par wapas!")
+        return await edit(*await _main_menu(client, user_id))
+
+    if arg == "all":
+        database.set_scope(user_id, None)
+        await callback_query.answer("🌐 Default settings")
+    else:
+        try:
+            tid = int(arg)
+        except ValueError:
+            return await callback_query.answer()
+        if tid not in {t for t, _ in await database.get_user_targets(user_id)}:
+            return await callback_query.answer("⚠️ Ye channel ab list mein nahi hai.", show_alert=True)
+        database.set_scope(user_id, tid)
+        await callback_query.answer("✅ Channel chuna gaya")
+    await edit(*await _main_menu(client, user_id))
 
 
 @Client.on_callback_query(filters.regex(r"^delay:(.+)$"))
@@ -1700,7 +1834,8 @@ async def cb_menu_input_cancel(client, callback_query):
     await callback_query.answer("❌ Cancelled")
 
     if back_key == "main" or back_key not in _MENU_RENDERERS:
-        return await callback_query.message.edit_text(MENU_HEADER, parse_mode=enums.ParseMode.HTML, reply_markup=_menu_main_markup())
+        text, kb = await _main_menu(client, user_id)
+        return await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
     text, kb = await _MENU_RENDERERS[back_key](user_id)
     await callback_query.message.edit_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
@@ -1845,6 +1980,6 @@ async def settings_menu_input_handler(client, message: Message):
         text, kb = await _MENU_RENDERERS[back_key](user_id)
         text = f"{msg}\n\n{text}" if msg else text
     else:
-        text, kb = MENU_HEADER, _menu_main_markup()
+        text, kb = await _main_menu(client, user_id)
 
     await message.reply_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)

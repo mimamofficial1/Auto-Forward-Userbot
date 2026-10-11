@@ -1,3 +1,4 @@
+import time
 import config
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -11,6 +12,7 @@ admins_col       = db['admins']
 banned_col       = db['banned_users']
 stats_col        = db['forward_stats']
 bot_users_col    = db['bot_users']        # ✅ tracks EVERY user who has started the bot (for broadcast)
+target_settings  = db['target_settings']  # ✅ NEW: per-channel overrides of user_settings (one doc per user+target)
 
 
 # ==================== BOT USERS (for broadcast) ====================
@@ -36,6 +38,16 @@ async def get_user_mappings(user_id):
     cursor = channel_mappings.find({"user_id": user_id})
     return await cursor.to_list(length=None)
 
+async def get_user_targets(user_id) -> list:
+    """[(target_id, title_or_None), ...] — is user ke saare alag-alag target channels."""
+    seen = {}
+    for m in await get_user_mappings(user_id):
+        titles = m.get("target_titles") or {}
+        for t in m.get("target_ids", []):
+            if t not in seen or (not seen[t] and titles.get(str(t))):
+                seen[t] = titles.get(str(t))
+    return list(seen.items())
+
 async def get_mapping_by_source(user_id, source_id):
     return await channel_mappings.find_one({"user_id": user_id, "source_id": source_id})
 
@@ -45,14 +57,19 @@ async def add_target_to_source(user_id, source_id, target_id, source_title, targ
         if target_id not in existing.get('target_ids', []):
             await channel_mappings.update_one(
                 {"user_id": user_id, "source_id": source_id},
-                {"$push": {"target_ids": target_id}, "$set": {"source_title": source_title}}
+                {"$push": {"target_ids": target_id},
+                 "$set": {"source_title": source_title, f"target_titles.{target_id}": target_title}}
             )
             return "added"
+        await channel_mappings.update_one(
+            {"user_id": user_id, "source_id": source_id},
+            {"$set": {f"target_titles.{target_id}": target_title}})
         return "exists"
     else:
         await channel_mappings.insert_one({
             "user_id": user_id, "source_id": source_id,
-            "target_ids": [target_id], "source_title": source_title
+            "target_ids": [target_id], "source_title": source_title,
+            "target_titles": {str(target_id): target_title}
         })
         return "created"
 
@@ -126,12 +143,87 @@ async def get_all_userbot_sessions():
 
 # ==================== USER SETTINGS ====================
 
-async def _get_settings(user_id: int) -> dict:
-    doc = await user_settings.find_one({"user_id": user_id})
-    return doc or {}
+# ✅ NEW — PER-CHANNEL SETTINGS
+# Har settings function ka pehla argument ab "key" hai:
+#   • int user_id            -> UI mein jo channel abhi chuna hua hai (neeche _scope), warna GLOBAL default
+#   • (user_id, None)        -> hamesha GLOBAL default
+#   • (user_id, target_id)   -> sirf us channel ki settings (global ke upar override)
+# Padhte waqt: global + channel override merge hota hai (channel jeetta hai).
+# Likhte waqt: sirf channel override doc mein jaata hai — baaki channels pe asar nahi.
+# Lists (filters/replace/...) copy-on-write: channel mein pehli baar edit karo to
+# global list ki copy banti hai aur wahi channel ke liye alag ho jaati hai.
+_SCOPE_TTL = 900  # seconds: itni der kuch na karo to wapas GLOBAL (taaki purane commands galti se kisi channel pe na lagein)
+_scope: dict = {}  # user_id -> (target_id, last_used_monotonic)
+_META_KEYS = ("_id", "user_id", "target_id")
 
-async def _update_settings(user_id: int, data: dict):
-    await user_settings.update_one({"user_id": user_id}, {"$set": data}, upsert=True)
+
+def set_scope(user_id: int, target_id):
+    """UI ke liye: aage ke saare settings edits is channel pe jaayenge (None = global)."""
+    if target_id is None:
+        _scope.pop(user_id, None)
+    else:
+        _scope[user_id] = (target_id, time.monotonic())
+
+
+def get_scope(user_id: int):
+    hit = _scope.get(user_id)
+    if not hit:
+        return None
+    if time.monotonic() - hit[1] > _SCOPE_TTL:
+        _scope.pop(user_id, None)
+        return None
+    _scope[user_id] = (hit[0], time.monotonic())  # use ho raha hai -> timer refresh
+    return hit[0]
+
+
+def _resolve(key):
+    if isinstance(key, tuple):
+        return key[0], key[1]
+    return key, get_scope(key)
+
+
+async def _get_settings(key) -> dict:
+    user_id, target_id = _resolve(key)
+    base = await user_settings.find_one({"user_id": user_id}) or {}
+    if target_id is None:
+        return base
+    over = await target_settings.find_one({"user_id": user_id, "target_id": target_id}) or {}
+    merged = dict(base)
+    for k, v in over.items():
+        if k in _META_KEYS:
+            continue
+        if k == "content_filters":
+            merged[k] = {**(base.get("content_filters") or {}), **(v or {})}
+        else:
+            merged[k] = v
+    return merged
+
+async def _update_settings(key, data: dict):
+    user_id, target_id = _resolve(key)
+    if target_id is None:
+        await user_settings.update_one({"user_id": user_id}, {"$set": data}, upsert=True)
+    else:
+        await target_settings.update_one(
+            {"user_id": user_id, "target_id": target_id}, {"$set": data}, upsert=True)
+
+async def _unset_settings(key, fields: list):
+    """Global: field hata do. Channel: None se override karo (warna global value wapas dikhne lagti)."""
+    user_id, target_id = _resolve(key)
+    if target_id is None:
+        await user_settings.update_one({"user_id": user_id}, {"$unset": {f: "" for f in fields}}, upsert=True)
+    else:
+        await target_settings.update_one(
+            {"user_id": user_id, "target_id": target_id}, {"$set": {f: None for f in fields}}, upsert=True)
+
+async def get_override_targets(user_id: int) -> set:
+    """Un channels ke ids jinki apni alag settings hain."""
+    rows = await target_settings.find({"user_id": user_id}, {"target_id": 1}).to_list(length=None)
+    return {r["target_id"] for r in rows}
+
+async def reset_scope(user_id: int, target_id: int) -> bool:
+    """Ek channel ki alag settings hata do -> wo wapas global default use karega."""
+    r = await target_settings.delete_one({"user_id": user_id, "target_id": target_id})
+    return r.deleted_count > 0
 
 # ── Forwarding ON/OFF ──
 async def set_forwarding(user_id: int, enabled: bool):
@@ -238,7 +330,7 @@ async def set_endtext(user_id: int, text: str):
     await _update_settings(user_id, {"endtext": text})
 
 async def remove_endtext(user_id: int):
-    await user_settings.update_one({"user_id": user_id}, {"$unset": {"endtext": ""}}, upsert=True)
+    await _unset_settings(user_id, ["endtext"])
 
 async def get_endtext(user_id: int) -> str | None:
     doc = await _get_settings(user_id)
@@ -268,7 +360,7 @@ async def get_caption_template(user_id: int) -> str | None:
     return doc.get("caption_template", None)
 
 async def remove_caption_template(user_id: int):
-    await user_settings.update_one({"user_id": user_id}, {"$unset": {"caption_template": ""}}, upsert=True)
+    await _unset_settings(user_id, ["caption_template"])
 
 
 # ==================== WORD REPLACE (Old:New rules) ====================
@@ -361,6 +453,7 @@ async def reset_all_settings(user_id: int):
         },
         upsert=True,
     )
+    await target_settings.delete_many({"user_id": user_id})  # ✅ NEW: channel overrides bhi
     await clear_all_mappings(user_id)
 
 

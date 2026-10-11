@@ -624,68 +624,91 @@ async def process_buffered_messages(source_chat_id, source_client=None):
             if not targets:
                 continue
 
-            if user_id and not await database.is_forwarding_enabled(user_id):
+            # Global pause (/off) sab channels ko roke rakhta hai
+            if user_id and not await database.is_forwarding_enabled((user_id, None)):
                 logger.info(f"Forwarding OFF for user {user_id}, skipping")
                 continue
 
-            user_filters = await database.get_filters(user_id) if user_id else []
-            if user_filters:
-                filtered_messages = []
-                for msg in messages:
-                    text = (msg.text or msg.caption or "").lower()
-                    if any(w in text for w in user_filters):
-                        filtered_messages.append(msg)
-                if not filtered_messages:
-                    logger.info(f"All messages filtered out for user {user_id}")
-                    continue
-                messages_to_send = filtered_messages
-            else:
-                messages_to_send = messages
+            # ✅ NEW: PER-CHANNEL SETTINGS — jin channels ki apni alag settings hain unka
+            # alag job banta hai; baaki (default settings wale) pehle ki tarah ek saath jaate hain.
+            try:
+                own = await database.get_override_targets(user_id) if user_id else set()
+            except Exception:
+                logger.exception("Could not load per-channel settings; using default settings")
+                own = set()
+            groups = []
+            plain = [t for t in targets if t not in own]
+            if plain:
+                groups.append((plain, (user_id, None) if user_id else None))
+            for t in targets:
+                if t in own:
+                    groups.append(([t], (user_id, t)))
 
-            # ✅ NEW: Blacklist — in words wale messages skip ho jaayenge
-            user_blacklist = await database.get_blacklist(user_id) if user_id else []
-            if user_blacklist:
-                messages_to_send = [
-                    msg for msg in messages_to_send
-                    if not any(w in (msg.text or msg.caption or "").lower() for w in user_blacklist)
-                ]
+            for group_targets, key in groups:
+                label = f"user {user_id}" + (f"/channel {group_targets[0]}" if key and key[1] is not None else "")
+
+                if key and key[1] is not None and not await database.is_forwarding_enabled(key):
+                    logger.info(f"Forwarding OFF for {label}, skipping")
+                    continue
+
+                user_filters = await database.get_filters(key) if key else []
+                if user_filters:
+                    filtered_messages = []
+                    for msg in messages:
+                        text = (msg.text or msg.caption or "").lower()
+                        if any(w in text for w in user_filters):
+                            filtered_messages.append(msg)
+                    if not filtered_messages:
+                        logger.info(f"All messages filtered out for {label}")
+                        continue
+                    messages_to_send = filtered_messages
+                else:
+                    messages_to_send = messages
+
+                # ✅ NEW: Blacklist — in words wale messages skip ho jaayenge
+                user_blacklist = await database.get_blacklist(key) if key else []
+                if user_blacklist:
+                    messages_to_send = [
+                        msg for msg in messages_to_send
+                        if not any(w in (msg.text or msg.caption or "").lower() for w in user_blacklist)
+                    ]
+                    if not messages_to_send:
+                        logger.info(f"All messages blacklisted for {label}")
+                        continue
+
+                # ✅ NEW: Custom Filters — content-type ke hisaab se allow/block
+                content_filters = await database.get_content_filters(key) if key else database.DEFAULT_CONTENT_FILTERS
+                messages_to_send = [msg for msg in messages_to_send if _content_type_allowed(msg, content_filters)]
                 if not messages_to_send:
-                    logger.info(f"All messages blacklisted for user {user_id}")
+                    logger.info(f"All messages blocked by content-type filter for {label}")
                     continue
 
-            # ✅ NEW: Custom Filters — content-type ke hisaab se allow/block
-            content_filters = await database.get_content_filters(user_id) if user_id else database.DEFAULT_CONTENT_FILTERS
-            messages_to_send = [msg for msg in messages_to_send if _content_type_allowed(msg, content_filters)]
-            if not messages_to_send:
-                logger.info(f"All messages blocked by content-type filter for user {user_id}")
-                continue
+                msg_delay        = await database.get_delay(key) if key else MSG_DELAY
+                endtext          = await database.get_endtext(key) if key else None
+                caption_template = await database.get_caption_template(key) if key else None
+                replace_rules    = await database.get_replacements(key) if key else []
+                remove_words     = await database.get_remove_words(key) if key else []
 
-            msg_delay        = await database.get_delay(user_id) if user_id else MSG_DELAY
-            endtext          = await database.get_endtext(user_id) if user_id else None
-            caption_template = await database.get_caption_template(user_id) if user_id else None
-            replace_rules    = await database.get_replacements(user_id) if user_id else []
-            remove_words     = await database.get_remove_words(user_id) if user_id else []
+                sender = source_client
+                if user_id and user_id in active_userbots:
+                    ub = active_userbots[user_id]
+                    if ub.is_connected:
+                        sender = ub
 
-            sender = source_client
-            if user_id and user_id in active_userbots:
-                ub = active_userbots[user_id]
-                if ub.is_connected:
-                    sender = ub
+                source_info = {
+                    "id": source_chat_id,
+                    "title": source_title,
+                    "user_id": user_id,
+                    "delay": msg_delay,
+                    "endtext": endtext or "",
+                    "caption_template": caption_template or "",
+                    "replace_rules": replace_rules,
+                    "remove_words": remove_words,
+                    "forward_tag": content_filters.get("forward_tag", False),
+                }
 
-            source_info = {
-                "id": source_chat_id,
-                "title": source_title,
-                "user_id": user_id,
-                "delay": msg_delay,
-                "endtext": endtext or "",
-                "caption_template": caption_template or "",
-                "replace_rules": replace_rules,
-                "remove_words": remove_words,
-                "forward_tag": content_filters.get("forward_tag", False),
-            }
-
-            await message_queue.put((messages_to_send.copy(), targets, "buffered", 0, sender, source_info))
-            logger.info(f"Queued {len(messages_to_send)} msgs from {source_chat_id} -> {len(targets)} targets")
+                await message_queue.put((messages_to_send.copy(), group_targets, "buffered", 0, sender, source_info))
+                logger.info(f"Queued {len(messages_to_send)} msgs from {source_chat_id} -> {len(group_targets)} targets ({label})")
 
     except asyncio.CancelledError:
         # Messages buffer mein safe hain — lost nahi honge
