@@ -2,7 +2,7 @@
 SilentXForward/fsub.py
 ──────────────────────
 Force Subscribe system.
-Checks if user has joined all required channels before using the bot.
+Checks that the user has joined every required channel before using the bot.
 """
 
 import logging
@@ -10,20 +10,20 @@ from pyrogram import Client, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 from config import FSUB_CHANNELS, OWNER_ID, FSUB_BANNER
+from SilentXForward import ui
 
 logger = logging.getLogger(__name__)
 
 
 async def check_fsub(client: Client, user_id: int) -> list:
     """
-    Check which channels user has NOT joined.
-    Returns list of unjoined channel dicts.
-    Owner is always exempt.
+    Return the required channels the user has NOT joined.
+    The owner is always exempt.
     """
     if not FSUB_CHANNELS:
         return []
 
-    # Owner bypass
+    # owner bypass
     if OWNER_ID and user_id == OWNER_ID:
         return []
 
@@ -31,7 +31,6 @@ async def check_fsub(client: Client, user_id: int) -> list:
     for ch in FSUB_CHANNELS:
         try:
             member = await client.get_chat_member(ch["id"], user_id)
-            # Check if banned/left
             if member.status in (
                 enums.ChatMemberStatus.BANNED,
                 enums.ChatMemberStatus.LEFT,
@@ -47,10 +46,16 @@ async def check_fsub(client: Client, user_id: int) -> list:
     return not_joined
 
 
-async def send_fsub_message(client, message, not_joined: list):
-    """Send the force subscribe message with banner image + join buttons."""
+def _caption(first_name: str) -> str:
+    return ui.screen(
+        "🔒", "Join to continue",
+        f"Hello {ui.esc(first_name)},",
+        f"To use {ui.BRAND} you need to be a member of our channel(s).\n"
+        "Join using the buttons below, then tap <b>I've Joined</b>.",
+    )
 
-    # Build join buttons
+
+async def _join_markup(client, not_joined: list) -> InlineKeyboardMarkup:
     buttons = []
     for i, ch in enumerate(not_joined, 1):
         try:
@@ -66,94 +71,48 @@ async def send_fsub_message(client, message, not_joined: list):
             except Exception:
                 link = "https://t.me"
 
-        buttons.append([InlineKeyboardButton(f"📢 JOIN {title}", url=link)])
+        buttons.append([InlineKeyboardButton(f"📢 Join {ui.trim(title, 40)}", url=link)])
 
-    # Try Again button
-    buttons.append([InlineKeyboardButton("🔄 TRY AGAIN", callback_data="fsub_verify")])
+    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="fsub_verify")])
+    return InlineKeyboardMarkup(buttons)
 
-    markup = InlineKeyboardMarkup(buttons)
 
-    caption = (
-        f"👋 <b>HELLO {message.from_user.first_name.upper()}!</b>\n\n"
-        f"⚠️ <b>ACCESS DENIED</b>\n\n"
-        f"<b>DUE TO HIGH SERVER TRAFFIC, ONLY CHANNEL SUBSCRIBERS CAN USE "
-        f"THIS SYSTEM. PLEASE JOIN OUR UPDATES CHANNEL TO UNLOCK ALL FEATURES.</b>"
-    )
+async def send_fsub_message(client, message, not_joined: list):
+    """Send the join prompt (banner image when configured) with the join buttons."""
+    markup = await _join_markup(client, not_joined)
+    caption = _caption(message.from_user.first_name)
 
     if FSUB_BANNER:
-        # Send banner image with caption
-        await message.reply_photo(
-            photo=FSUB_BANNER,
-            caption=caption,
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=markup
-        )
+        await message.reply_photo(photo=FSUB_BANNER, caption=caption,
+                                  parse_mode=enums.ParseMode.HTML, reply_markup=markup)
     else:
-        # Fallback: text only (no banner set)
-        await message.reply_text(
-            caption,
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=markup
-        )
+        await message.reply_text(caption, parse_mode=enums.ParseMode.HTML, reply_markup=markup)
 
 
 async def fsub_verify_callback(client, callback_query):
-    """Handle the verify button click."""
-    user_id    = callback_query.from_user.id
+    """Handle the “I've Joined” button."""
+    user_id = callback_query.from_user.id
     not_joined = await check_fsub(client, user_id)
 
     if not not_joined:
-        # All joined!
-        await callback_query.answer("✅ Access Granted! You can now use the bot.", show_alert=True)
+        await callback_query.answer("Verified — you can use the bot now. Send /start.", show_alert=True)
         await callback_query.message.delete()
-    else:
-        pending = len(not_joined)
+        return
 
-        # Rebuild buttons for remaining channels
-        buttons = []
-        for i, ch in enumerate(not_joined, 1):
-            try:
-                chat = await client.get_chat(ch["id"])
-                title = chat.title or f"Channel {i}"
-            except Exception:
-                title = f"Channel {i}"
+    await callback_query.answer(
+        f"You still need to join {len(not_joined)} channel(s).",
+        show_alert=True
+    )
+    markup = await _join_markup(client, not_joined)
+    caption = _caption(callback_query.from_user.first_name)
 
-            link = ch.get("link")
-            if not link:
-                try:
-                    link = await client.export_chat_invite_link(ch["id"])
-                except Exception:
-                    link = "https://t.me"
-
-            buttons.append([InlineKeyboardButton(f"📢 JOIN {title}", url=link)])
-
-        buttons.append([InlineKeyboardButton("🔄 TRY AGAIN", callback_data="fsub_verify")])
-
-        await callback_query.answer(
-            f"❌ Still {pending} channel(s) pending! Join all to get access.",
-            show_alert=True
-        )
-
-        # Edit caption if photo message, else edit text
+    # edit the caption if the prompt is a photo, otherwise the text
+    try:
+        await callback_query.message.edit_caption(
+            caption=caption, parse_mode=enums.ParseMode.HTML, reply_markup=markup)
+    except Exception:
         try:
-            await callback_query.message.edit_caption(
-                caption=(
-                    f"👋 <b>HELLO {callback_query.from_user.first_name.upper()}!</b>\n\n"
-                    f"⚠️ <b>ACCESS DENIED</b>\n\n"
-                    f"<b>DUE TO HIGH SERVER TRAFFIC, ONLY CHANNEL SUBSCRIBERS CAN USE "
-                    f"THIS SYSTEM. PLEASE JOIN OUR UPDATES CHANNEL TO UNLOCK ALL FEATURES.</b>"
-                ),
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-        except Exception:
             await callback_query.message.edit_text(
-                text=(
-                    f"👋 <b>HELLO {callback_query.from_user.first_name.upper()}!</b>\n\n"
-                    f"⚠️ <b>ACCESS DENIED</b>\n\n"
-                    f"<b>DUE TO HIGH SERVER TRAFFIC, ONLY CHANNEL SUBSCRIBERS CAN USE "
-                    f"THIS SYSTEM. PLEASE JOIN OUR UPDATES CHANNEL TO UNLOCK ALL FEATURES.</b>"
-                ),
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
+                text=caption, parse_mode=enums.ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            pass  # unchanged content — nothing to update
