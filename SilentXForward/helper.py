@@ -31,11 +31,11 @@ login_states = {}
 
 async def send(message, text: str, markup=None):
     """Reply with HTML, no link previews."""
-    return await message.reply_text(text, parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+    return await message.reply_text(ui.finish(text), parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
 
 
 async def edit(message, text: str, markup=None):
-    return await message.edit_text(text, parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+    return await message.edit_text(ui.finish(text), parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
 
 
 async def send_long(message, text: str, markup=None, limit: int = 3800):
@@ -165,7 +165,7 @@ async def start_command(client, message):
 
         await database.save_user(message.from_user.id)  # keeps the broadcast list complete
         await log_new_user(client, message.from_user)
-        await message.reply_photo(photo=START_IMAGE, caption=ui.START_TEXT,
+        await message.reply_photo(photo=START_IMAGE, caption=ui.finish(ui.START_TEXT),
                                   parse_mode=HTML, reply_markup=ui.start_buttons())
     except Exception as e:
         logger.error(f"Start error: {e}")
@@ -1092,7 +1092,7 @@ async def _render_scope_picker(client, user_id: int, page: int = 0):
     page = max(0, min(page, pages - 1))
     for t, _ in targets[page * _SCOPE_PAGE:(page + 1) * _SCOPE_PAGE]:
         mark = ("✅ " if t == current else "") + ("✏️ " if t in own else "")
-        rows.append([btn(ui.trim(f"{mark}{names[t]}", 56), f"scope:{t}")])
+        rows.append([btn(ui.trim(f"{mark}{names[t]}", 56), f"scope:{t}", raw=True)])
     if pages > 1:
         nav_row = []
         if page > 0:

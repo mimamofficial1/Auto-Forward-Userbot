@@ -47,12 +47,12 @@ async def check_fsub(client: Client, user_id: int) -> list:
 
 
 def _caption(first_name: str) -> str:
-    return ui.screen(
+    return ui.finish(ui.screen(
         "🔒", "Join to continue",
         f"Hello {ui.esc(first_name)},",
         f"To use {ui.BRAND} you need to be a member of our channel(s).\n"
         "Join using the buttons below, then tap <b>I've Joined</b>.",
-    )
+    ))
 
 
 async def _join_markup(client, not_joined: list) -> InlineKeyboardMarkup:
@@ -71,9 +71,10 @@ async def _join_markup(client, not_joined: list) -> InlineKeyboardMarkup:
             except Exception:
                 link = "https://t.me"
 
-        buttons.append([InlineKeyboardButton(f"📢 Join {ui.trim(title, 40)}", url=link)])
+        # the word “Join” is small caps; the channel name stays exactly as written
+        buttons.append([InlineKeyboardButton(ui.sc("📢 Join ") + ui.trim(title, 36), url=link)])
 
-    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="fsub_verify")])
+    buttons.append([ui.btn("✅ I've Joined", "fsub_verify")])
     return InlineKeyboardMarkup(buttons)
 
 

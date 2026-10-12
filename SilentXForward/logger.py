@@ -9,7 +9,7 @@ import logging
 from datetime import datetime
 from pyrogram import enums
 from config import LOG_CHANNEL
-from SilentXForward.ui import esc, code, kv, screen
+from SilentXForward.ui import esc, code, kv, screen, bold_all
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ async def send_log(client, text: str):
     try:
         await client.send_message(
             chat_id=LOG_CHANNEL,
-            text=text,
+            text=bold_all(text),
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True
         )

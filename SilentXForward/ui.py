@@ -13,6 +13,7 @@ Style rules
   • Buttons: one emoji + Title Case, two per row at most, Back / Close at the bottom.
 """
 import html
+import re
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -26,6 +27,46 @@ LINK_DEV = "https://t.me/mimam_officialx"
 LINK_MAINTAINER = "https://t.me/Dark_of_Danger"
 
 _ICONS = {"ok": "✅", "warn": "⚠️", "err": "❌", "info": "ℹ️", "on": "▶️", "off": "⏸️", "stop": "🚫", "lock": "🔒"}
+
+
+# ═══════════════════════════ typography ═══════════════════════════
+# • Buttons use ꜱᴍᴀʟʟ ᴄᴀᴘꜱ (only a–z letters change; emoji, digits and symbols stay).
+# • Every message the bot sends is BOLD (finish() / bold_all()); code values stay monospace.
+
+_SMALLCAPS = str.maketrans(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ",
+)
+
+
+def sc(text: str) -> str:
+    """Small-caps style for button labels."""
+    return text.translate(_SMALLCAPS)
+
+
+_BQ = re.compile(r"(<blockquote>.*?</blockquote>)", re.S)
+_B_TAGS = re.compile(r"</?b>")
+
+
+def _bold_segment(seg: str) -> str:
+    seg = _B_TAGS.sub("", seg)  # avoid <b><b>…</b></b>
+    m = re.match(r"^(\s*)(.*?)(\s*)$", seg, re.S)
+    lead, core, tail = m.group(1), m.group(2), m.group(3)
+    return f"{lead}<b>{core}</b>{tail}" if core else seg
+
+
+def bold_all(text: str) -> str:
+    """Make a whole HTML message bold. Block quotes are bolded inside; nothing is nested twice."""
+    out = []
+    for part in _BQ.split(text):
+        if part.startswith("<blockquote>"):
+            out.append("<blockquote>" + _bold_segment(part[len("<blockquote>"):-len("</blockquote>")]) + "</blockquote>")
+        else:
+            out.append(_bold_segment(part))
+    return "".join(out)
+
+
+finish = bold_all  # the one call every outgoing UI message goes through
 
 
 # ═══════════════════════════ text primitives ═══════════════════════════
@@ -106,12 +147,13 @@ def trim(text: str, n: int = 60) -> str:
 
 # ═══════════════════════════ buttons ═══════════════════════════
 
-def btn(label: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(label, callback_data=data)
+def btn(label: str, data: str, raw: bool = False) -> InlineKeyboardButton:
+    """raw=True keeps the label untouched (use it for chat names and other user data)."""
+    return InlineKeyboardButton(label if raw else sc(label), callback_data=data)
 
 
-def ubtn(label: str, url: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(label, url=url)
+def ubtn(label: str, url: str, raw: bool = False) -> InlineKeyboardButton:
+    return InlineKeyboardButton(label if raw else sc(label), url=url)
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
