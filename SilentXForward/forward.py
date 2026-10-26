@@ -1,7 +1,8 @@
 import asyncio
+import html as _html
 import logging
 from collections import defaultdict
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, RPCError, ChannelInvalid, ChannelPrivate, ChatAdminRequired, PeerIdInvalid
 from SilentXForward import database
 from SilentXForward import caption as caption_engine
@@ -330,6 +331,39 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
             except Exception:
                 logger.exception("Caption engine failed, falling back to original caption")
                 final_caption = None
+
+        # ✅ NEW: Plain TEXT message — copy_message text pe caption ignore kar deta hai,
+        # isliye footer/caption template yahan manually send_message se lagate hain.
+        if has_customization and getattr(message, "text", None):
+            try:
+                simple = not (cs.get("caption_template") or cs.get("replace_rules") or cs.get("remove_words"))
+                if simple:
+                    # sirf footer hai — original formatting (bold/links) preserve karo
+                    body = message.text.html
+                else:
+                    body = _html.escape(caption_engine.build_final_caption(
+                        message,
+                        caption_template=cs.get("caption_template", ""),
+                        endtext="",
+                        replace_rules=cs.get("replace_rules"),
+                        remove_words=cs.get("remove_words"),
+                    ))
+                endtext = cs.get("endtext", "")
+                text_out = f"{body}\n\n{endtext}".strip() if (body and endtext) else (body or endtext)
+            except Exception:
+                logger.exception("Text caption build failed, falling back to plain copy")
+                text_out = None
+
+            if text_out:
+                await handle_flood(
+                    writer.send_message,
+                    chat_id=chat_id,
+                    text=text_out,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=message.reply_markup,
+                )
+                _invalid_target_strikes.pop(chat_id, None)
+                return True
 
         if final_caption:
             await handle_flood(
