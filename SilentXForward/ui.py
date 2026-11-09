@@ -242,7 +242,7 @@ _GUIDE = {
         "/blacklist <code>word</code>\n"
         "/remove_blacklist <code>word</code>\n"
         "/listblacklist\n\n"
-        "<b>Content types</b> — /customfilters (text, video, photo, forward tag…)")),
+        "<b>Content types</b> — /customfilters (text, video, photo, GIFs, skip duplicates, forward tag…)")),
     "caption": ("📝", "Caption & Footer", (
         "<b>Caption template</b>\n"
         "/setcaption <code>template</code> · /showcaption · /delcaption\n\n"
@@ -357,6 +357,10 @@ CF_LABELS = {
     "photo":       "Photos",
     "audio":       "Audio",
     "sticker":     "Stickers",
+    "voice":       "Voice",
+    "video_note":  "Video Notes",
+    "animation":   "GIFs",
+    "skip_duplicates": "Skip Duplicates",
 }
 
 RESET_WARN_TEXT = screen(

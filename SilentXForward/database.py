@@ -13,6 +13,7 @@ banned_col       = db['banned_users']
 stats_col        = db['forward_stats']
 bot_users_col    = db['bot_users']        # ✅ tracks EVERY user who has started the bot (for broadcast)
 target_settings  = db['target_settings']  # ✅ NEW: per-channel overrides of user_settings (one doc per user+target)
+forwarded_files  = db['forwarded_files']  # ✅ NEW: duplicate protection — (user, target, file_unique_id)
 
 
 # ==================== BOT USERS (for broadcast) ====================
@@ -120,8 +121,67 @@ async def remove_invalid_target(target_id: int):
 
 # ==================== USERBOT SESSIONS ====================
 
+# ── Session encryption ────────────────────────────────────────────────────────
+# Session string DB mein ENCRYPTED (Fernet/AES) save hoti hai, taaki DB leak hone par bhi
+# koi uska account use na kar sake. Key kahan se aati hai:
+#   • env SESSION_ENC_KEY (agar set hai), warna
+#   • API_HASH se apne-aap bani — koi extra setup nahi chahiye.
+# Purani plaintext sessions bot start hote hi apne-aap encrypt ho jaati hain.
+_ENC_PREFIX = "enc:v1:"
+_fernet = None
+
+
+def _get_fernet():
+    global _fernet
+    if _fernet is not None:
+        return _fernet or None
+    try:
+        import os, base64, hashlib
+        from cryptography.fernet import Fernet
+        secret = os.environ.get("SESSION_ENC_KEY") or str(getattr(config, "API_HASH", "") or "")
+        if not secret:
+            raise ValueError("no secret available")
+        raw = hashlib.pbkdf2_hmac("sha256", secret.encode(), b"silentxforward-session-v1", 200_000)
+        _fernet = Fernet(base64.urlsafe_b64encode(raw))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Session encryption unavailable, storing plain: {e}")
+        _fernet = False
+    return _fernet or None
+
+
+def _encrypt_session(value: str) -> str:
+    f = _get_fernet()
+    if not f or not value or value.startswith(_ENC_PREFIX):
+        return value
+    return _ENC_PREFIX + f.encrypt(value.encode()).decode()
+
+
+def _decrypt_session(value):
+    if not value or not str(value).startswith(_ENC_PREFIX):
+        return value                       # purani plaintext session — as-is
+    f = _get_fernet()
+    try:
+        if not f:
+            raise ValueError("encryption key unavailable")
+        return f.decrypt(value[len(_ENC_PREFIX):].encode()).decode()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(
+            f"Session decrypt failed (key badla? SESSION_ENC_KEY / API_HASH check karo): {e}")
+        return None
+
+
+def _with_decrypted(doc):
+    if doc and doc.get("session_string"):
+        doc = dict(doc)
+        doc["session_string"] = _decrypt_session(doc["session_string"])
+    return doc
+
+
 async def save_userbot_session(user_id: int, session_string: str, phone: str):
     from datetime import datetime
+    session_string = _encrypt_session(session_string)
     await userbot_sessions.update_one(
         {"user_id": user_id},
         {"$set": {"user_id": user_id, "session_string": session_string,
@@ -130,7 +190,7 @@ async def save_userbot_session(user_id: int, session_string: str, phone: str):
     )
 
 async def get_userbot_session(user_id: int):
-    return await userbot_sessions.find_one({"user_id": user_id})
+    return _with_decrypted(await userbot_sessions.find_one({"user_id": user_id}))
 
 async def delete_userbot_session(user_id: int) -> bool:
     result = await userbot_sessions.delete_one({"user_id": user_id})
@@ -138,7 +198,18 @@ async def delete_userbot_session(user_id: int) -> bool:
 
 async def get_all_userbot_sessions():
     cursor = userbot_sessions.find({})
-    return await cursor.to_list(length=None)
+    docs = await cursor.to_list(length=None)
+    # purani plaintext sessions ko ek baar encrypt kar do (auto-migration)
+    if _get_fernet():
+        for d in docs:
+            ss = d.get("session_string")
+            if ss and not str(ss).startswith(_ENC_PREFIX):
+                try:
+                    await userbot_sessions.update_one(
+                        {"_id": d["_id"]}, {"$set": {"session_string": _encrypt_session(ss)}})
+                except Exception:
+                    pass
+    return [_with_decrypted(d) for d in docs]
 
 
 # ==================== USER SETTINGS ====================
@@ -307,6 +378,10 @@ DEFAULT_CONTENT_FILTERS = {
     "photo": True,
     "audio": True,
     "sticker": True,
+    "voice": True,
+    "video_note": True,
+    "animation": True,
+    "skip_duplicates": True,   # ✅ NEW: same file (file_unique_id) dobara same target pe post nahi hoga
 }
 
 async def get_content_filters(user_id: int) -> dict:
@@ -324,6 +399,51 @@ async def toggle_content_filter(user_id: int, key: str) -> bool:
     cf[key] = not cf[key]
     await _update_settings(user_id, {"content_filters": cf})
     return cf[key]
+
+# ==================== DUPLICATE PROTECTION ====================
+# Ek hi file (file_unique_id) do alag sources se aaye to same target pe sirf ek baar post hogi.
+# Har (user, target, file) ka ek record banta hai; unique index ki wajah se do sources ek
+# saath bhi aayein to sirf ek hi "claim" jeet'ta hai. Purane records DEDUP_TTL_DAYS baad
+# apne-aap delete ho jaate hain (DB bada na ho).
+DEDUP_TTL_DAYS = 60
+_dedup_ready = False
+
+
+async def _ensure_dedup_index():
+    global _dedup_ready
+    if _dedup_ready:
+        return
+    await forwarded_files.create_index(
+        [("user_id", 1), ("target_id", 1), ("file_unique_id", 1)], unique=True)
+    await forwarded_files.create_index("created_at", expireAfterSeconds=DEDUP_TTL_DAYS * 86400)
+    _dedup_ready = True
+
+
+async def claim_file(user_id: int, target_id: int, file_unique_id: str) -> bool:
+    """True = file naya hai (claim ho gaya, forward karo). False = pehle ja chuka hai (skip)."""
+    import logging
+    from datetime import datetime
+    from pymongo.errors import DuplicateKeyError
+    try:
+        await _ensure_dedup_index()
+        await forwarded_files.insert_one({
+            "user_id": user_id, "target_id": target_id,
+            "file_unique_id": file_unique_id, "created_at": datetime.utcnow(),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+    except Exception as e:
+        # DB glitch pe forwarding band nahi honi chahiye — fail-open
+        logging.getLogger(__name__).warning(f"claim_file failed (allowing forward): {e}")
+        return True
+
+
+async def release_file(user_id: int, target_id: int, file_unique_id: str):
+    """Forward fail ho gaya to claim wapas lo, taaki retry mein file skip na ho."""
+    await forwarded_files.delete_one(
+        {"user_id": user_id, "target_id": target_id, "file_unique_id": file_unique_id})
+
 
 # ── End Text (Footer) ──
 async def set_endtext(user_id: int, text: str):

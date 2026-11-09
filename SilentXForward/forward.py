@@ -3,6 +3,7 @@ import html as _html
 import logging
 from collections import defaultdict
 from pyrogram import Client, filters, enums
+from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
 from pyrogram.errors import FloodWait, RPCError, ChannelInvalid, ChannelPrivate, ChatAdminRequired, PeerIdInvalid
 from SilentXForward import database
 from SilentXForward import caption as caption_engine
@@ -10,7 +11,9 @@ from SilentXForward.cover_copy import has_cover, copy_with_cover, COVER_SUPPORTE
 import config as cfg
 
 # ================= CONFIG =================
-BUFFER_DELAY    = 3      # Wait 3s after LAST message before forwarding
+BUFFER_DELAY    = 1.0    # ⚡ Wait 1s after LAST message before forwarding (pehle 3s tha)
+MAX_BUFFER_WAIT = 6.0    # ⚡ Lagataar aate messages ko bhi max itni der se zyada nahi rokna
+BUFFER_POLL     = 0.25   # ⚡ Kitni baar check karein ki ab forward kar sakte hain
 QUEUE_WORKERS   = 3
 TARGET_CONCURRENCY = 3
 MSG_DELAY       = 0.1
@@ -25,6 +28,7 @@ message_queue  = asyncio.Queue()
 message_buffer = defaultdict(list)
 buffer_tasks   = {}
 buffer_timers  = {}   # ✅ NEW: tracks last message time per chat
+_title_cache: dict[int, str] = {}   # ⚡ source chat ka naam — har batch pe get_chat network call nahi
 
 # Dedup tracker
 seen_message_ids: dict[int, set] = defaultdict(set)
@@ -221,6 +225,12 @@ def _content_type_allowed(msg, content_filters: dict) -> bool:
     """
     if getattr(msg, "sticker", None):
         return content_filters.get("sticker", True)
+    if getattr(msg, "voice", None):
+        return content_filters.get("voice", True)
+    if getattr(msg, "video_note", None):
+        return content_filters.get("video_note", True)
+    if getattr(msg, "animation", None):
+        return content_filters.get("animation", True)
     if getattr(msg, "document", None):
         return content_filters.get("document", True)
     if getattr(msg, "video", None):
@@ -290,9 +300,42 @@ async def _copy_keep_cover(writer, chat_id, from_chat_id, message_id, src=None, 
     return await writer.copy_message(**kwargs)
 
 
-# ================= SINGLE FORWARD =================
+# ================= DUPLICATE PROTECTION =================
+def _file_unique_id(msg):
+    """Message ki media ka file_unique_id (alag sources se aayi same file ka ID same hota hai).
+    Text / poll / location / sticker pe None — unpe duplicate check nahi lagta."""
+    for attr in ("video", "document", "audio", "animation", "voice", "video_note", "photo"):
+        media = getattr(msg, attr, None)
+        if media:
+            return getattr(media, "file_unique_id", None)
+    return None
+
+
 async def forward_single_message(client, message, chat_id, sender_client=None, caption_settings: dict = None):
+    cs = caption_settings or {}
+    uid = cs.get("user_id")
+    fuid = _file_unique_id(message) if (uid and cs.get("skip_duplicates")) else None
+
+    if fuid and not await database.claim_file(uid, chat_id, fuid):
+        logger.info(f"Duplicate file skipped msg_id={message.id} -> {chat_id} (user {uid})")
+        return False
+
+    ok = False
+    try:
+        ok = await _forward_single_message(client, message, chat_id, sender_client, caption_settings)
+        return ok
+    finally:
+        if fuid and not ok:
+            try:
+                await database.release_file(uid, chat_id, fuid)
+            except Exception:
+                pass
+
+
+# ================= SINGLE FORWARD =================
+async def _forward_single_message(client, message, chat_id, sender_client=None, caption_settings: dict = None):
     writer = sender_client if sender_client else client
+    final_caption = None  # ✅ fallback paths bhi footer/caption use kar sakein
     try:
         # ✅ FIX: forward karne se pehle peer resolve karo
         await _ensure_peer_resolved(writer, chat_id)
@@ -409,6 +452,7 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
                     from_chat_id=message.chat.id,
                     message_id=message.id,
                     src=message,
+                    caption=final_caption or None,
                 )
                 _invalid_target_strikes.pop(chat_id, None)
                 return True
@@ -441,6 +485,7 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
                     from_chat_id=message.chat.id,
                     message_id=message.id,
                     src=message,
+                    caption=final_caption or None,
                 )
                 return True
             except Exception:
@@ -448,17 +493,157 @@ async def forward_single_message(client, message, chat_id, sender_client=None, c
         return False
 
 
+# ================= ALBUM (MEDIA GROUP) =================
+def _group_albums(messages):
+    """Sorted messages -> list of items. Item = [msg] (single) ya [m1, m2, ...] (album, max 10)."""
+    items, groups = [], {}
+    for m in sorted(messages, key=lambda m: m.id):
+        gid = getattr(m, "media_group_id", None)
+        if gid and (getattr(m, "photo", None) or getattr(m, "video", None) or
+                    getattr(m, "audio", None) or getattr(m, "document", None)):
+            if gid not in groups:
+                groups[gid] = []
+                items.append(groups[gid])
+            groups[gid].append(m)
+        else:
+            items.append([m])
+    out = []
+    for it in items:
+        for i in range(0, len(it), 10):   # Telegram album limit = 10
+            out.append(it[i:i + 10])
+    return out
+
+
+async def forward_album(client, album, chat_id, sender_client=None, caption_settings: dict = None) -> int:
+    """Album ko ek group ke roop mein forward karo. Caption/footer pehle item pe lagta hai
+    (Telegram album ka caption wahi dikhata hai). Kuch bhi fail ho to har message alag bhej deta hai.
+    Returns: kitne messages gaye."""
+    cs = caption_settings or {}
+    writer = sender_client if sender_client else client
+    uid = cs.get("user_id")
+    dedup = bool(uid and cs.get("skip_duplicates"))
+
+    # Duplicate files hatao (har file ka alag claim)
+    keep, claims = [], {}
+    for m in album:
+        fuid = _file_unique_id(m) if dedup else None
+        if fuid and not await database.claim_file(uid, chat_id, fuid):
+            logger.info(f"Duplicate file skipped in album msg_id={m.id} -> {chat_id} (user {uid})")
+            continue
+        keep.append(m)
+        if fuid:
+            claims[m.id] = fuid
+
+    async def _release(msg_ids=None):
+        for mid, fu in list(claims.items()):
+            if msg_ids is None or mid in msg_ids:
+                try:
+                    await database.release_file(uid, chat_id, fu)
+                except Exception:
+                    pass
+                claims.pop(mid, None)
+
+    if not keep:
+        return 0
+    if len(keep) == 1:                      # album mein ek hi file bachi — normal path
+        await _release()
+        return 1 if await forward_single_message(client, keep[0], chat_id,
+                                                 sender_client=sender_client,
+                                                 caption_settings=caption_settings) else 0
+
+    try:
+        await _ensure_peer_resolved(writer, chat_id)
+        from_chat = keep[0].chat.id
+
+        if cs.get("forward_tag"):
+            await handle_flood(writer.forward_messages, chat_id=chat_id,
+                               from_chat_id=from_chat, message_ids=[m.id for m in keep])
+            _invalid_target_strikes.pop(chat_id, None)
+            return len(keep)
+
+        # file_id sirf usi account ke liye valid hai jisne message fetch kiya — writer se fresh lo
+        if all(getattr(m, "_client", None) is writer for m in keep):
+            fresh = keep
+        else:
+            ids = {m.id for m in keep}
+            got = await handle_flood(writer.get_media_group, chat_id=from_chat, message_id=keep[0].id)
+            fresh = [m for m in got if m.id in ids]
+            if len(fresh) != len(keep):
+                raise ValueError("album fetch mismatch")
+
+        cap_msg = next((m for m in fresh if m.caption), fresh[0])
+        caption = None
+        if cs.get("caption_template") or cs.get("endtext") or cs.get("replace_rules") or cs.get("remove_words"):
+            try:
+                caption = caption_engine.build_final_caption(
+                    cap_msg,
+                    caption_template=cs.get("caption_template", ""),
+                    endtext=cs.get("endtext", ""),
+                    replace_rules=cs.get("replace_rules"),
+                    remove_words=cs.get("remove_words"),
+                )
+            except Exception:
+                logger.exception("Caption engine failed for album, using original caption")
+        if caption is None:
+            caption = cap_msg.caption.html if cap_msg.caption else ""
+
+        media = []
+        for i, m in enumerate(fresh):
+            cap = caption if i == 0 else ""
+            spoiler = bool(getattr(m, "has_media_spoiler", False))
+            if m.photo:
+                media.append(InputMediaPhoto(m.photo.file_id, caption=cap, has_spoiler=spoiler))
+            elif m.video:
+                media.append(InputMediaVideo(m.video.file_id, caption=cap, has_spoiler=spoiler))
+            elif m.audio:
+                media.append(InputMediaAudio(m.audio.file_id, caption=cap))
+            elif m.document:
+                media.append(InputMediaDocument(m.document.file_id, caption=cap))
+            else:
+                raise ValueError("unsupported album item")
+
+        await handle_flood(writer.send_media_group, chat_id=chat_id, media=media)
+        _invalid_target_strikes.pop(chat_id, None)
+        return len(keep)
+
+    except Exception as e:
+        # Album fail hua — har message alag bhejo (puraana, bharosemand tareeka).
+        # Claims rakhte hain (file ja rahi hai), dedup dobara nahi lagana; jo fail ho uska claim wapas.
+        logger.warning(f"Album send failed ({type(e).__name__}: {e}) -> per-message fallback")
+        cs2 = dict(cs, skip_duplicates=False)
+        sent = 0
+        for m in keep:
+            ok = False
+            try:
+                ok = await forward_single_message(client, m, chat_id,
+                                                  sender_client=sender_client, caption_settings=cs2)
+            except Exception:
+                logger.exception(f"Album fallback failed msg_id={m.id} -> {chat_id}")
+            if ok:
+                sent += 1
+            else:
+                await _release({m.id})
+            await asyncio.sleep(MSG_DELAY)
+        return sent
+
+
 # ================= BUFFER FORWARD =================
 async def forward_buffered_messages(client, messages, chat_id, sender_client=None,
                                      msg_delay: float = MSG_DELAY, caption_settings: dict = None):
     success = 0
-    for msg in sorted(messages, key=lambda m: m.id):
+    for item in _group_albums(messages):
         try:
-            ok = await forward_single_message(client, msg, chat_id,
-                                              sender_client=sender_client,
-                                              caption_settings=caption_settings)
-            if ok:
-                success += 1
+            if len(item) > 1:
+                # ✅ NEW: album ek saath, ek hi group mein jaata hai
+                success += await forward_album(client, item, chat_id,
+                                               sender_client=sender_client,
+                                               caption_settings=caption_settings)
+            else:
+                ok = await forward_single_message(client, item[0], chat_id,
+                                                 sender_client=sender_client,
+                                                 caption_settings=caption_settings)
+                if ok:
+                    success += 1
         except Exception:
             logger.exception(f"Error forwarding buffered msg -> {chat_id}")
         await asyncio.sleep(msg_delay)
@@ -498,6 +683,8 @@ async def process_queue(client):
                 "replace_rules": source_info.get("replace_rules") or [],
                 "remove_words": source_info.get("remove_words") or [],
                 "forward_tag": source_info.get("forward_tag", False),
+                "user_id": user_id,
+                "skip_duplicates": source_info.get("skip_duplicates", False),
             }
             failed        = []
             succeeded     = []
@@ -614,20 +801,37 @@ async def process_buffered_messages(source_chat_id, source_client=None):
     tabhi saare collected messages forward karo.
     Isse bulk messages mein koi bhi skip nahi hoga.
     """
+    restart = False
     try:
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        forced = False
         while True:
-            await asyncio.sleep(BUFFER_DELAY)
-            # Check: last message kitne time pehle aaya?
-            last_time = buffer_timers.get(source_chat_id, 0)
-            now = asyncio.get_event_loop().time()
-            if now - last_time < BUFFER_DELAY:
-                # Abhi bhi messages aa rahe hain — aur wait karo
-                continue
-            # Kaafi der se koi message nahi aaya — ab forward karo
-            break
+            await asyncio.sleep(BUFFER_POLL)
+            now = loop.time()
+            # ⚡ BUFFER_DELAY tak koi naya message nahi aaya — forward karo
+            if now - buffer_timers.get(source_chat_id, 0) >= BUFFER_DELAY:
+                break
+            # ⚡ Lagataar messages aa rahe hain (bulk / bot stream) — MAX_BUFFER_WAIT ke baad
+            # jo jama hai wo bhej do, pause ka intezaar mat karo
+            if now - started >= MAX_BUFFER_WAIT:
+                forced = True
+                break
 
         messages = message_buffer.pop(source_chat_id, None)
         buffer_timers.pop(source_chat_id, None)
+
+        # Cap pe flush hua aur sabse naya message abhi-abhi aaya album ka hissa hai —
+        # to us album ko agle round tak rok lo, taaki album beech se na kate.
+        if messages and forced:
+            gid = getattr(messages[-1], "media_group_id", None)
+            if gid:
+                held = [m for m in messages if getattr(m, "media_group_id", None) == gid]
+                messages = [m for m in messages if getattr(m, "media_group_id", None) != gid]
+                if held:
+                    message_buffer[source_chat_id] = held
+                    buffer_timers[source_chat_id] = loop.time()
+                    restart = True
 
         if not messages:
             return
@@ -643,13 +847,16 @@ async def process_buffered_messages(source_chat_id, source_client=None):
 
         logger.info(f"Processing {len(messages)} buffered msgs from {source_chat_id}")
 
-        source_title = str(source_chat_id)
-        try:
-            if source_client:
+        source_title = _title_cache.get(source_chat_id, str(source_chat_id))
+        if source_chat_id not in _title_cache and source_client:
+            try:
                 chat = await source_client.get_chat(source_chat_id)
                 source_title = chat_display_name(chat)
-        except Exception:
-            pass
+                if len(_title_cache) > 500:
+                    _title_cache.clear()
+                _title_cache[source_chat_id] = source_title
+            except Exception:
+                pass
 
         mappings = await database.get_all_targets_for_source(source_chat_id)
         for mapping in mappings:
@@ -685,7 +892,20 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                     logger.info(f"Forwarding OFF for {label}, skipping")
                     continue
 
-                user_filters = await database.get_filters(key) if key else []
+                # ⚡ Saari settings ek saath (parallel) laao — pehle 8 DB calls ek-ek karke hoti thi
+                async def _const(v):
+                    return v
+                (user_filters, user_blacklist, content_filters, msg_delay, endtext,
+                 caption_template, replace_rules, remove_words) = await asyncio.gather(
+                    database.get_filters(key) if key else _const([]),
+                    database.get_blacklist(key) if key else _const([]),
+                    database.get_content_filters(key) if key else _const(database.DEFAULT_CONTENT_FILTERS),
+                    database.get_delay(key) if key else _const(MSG_DELAY),
+                    database.get_endtext(key) if key else _const(None),
+                    database.get_caption_template(key) if key else _const(None),
+                    database.get_replacements(key) if key else _const([]),
+                    database.get_remove_words(key) if key else _const([]),
+                )
                 if user_filters:
                     filtered_messages = []
                     for msg in messages:
@@ -700,7 +920,6 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                     messages_to_send = messages
 
                 # ✅ NEW: Blacklist — in words wale messages skip ho jaayenge
-                user_blacklist = await database.get_blacklist(key) if key else []
                 if user_blacklist:
                     messages_to_send = [
                         msg for msg in messages_to_send
@@ -711,17 +930,11 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                         continue
 
                 # ✅ NEW: Custom Filters — content-type ke hisaab se allow/block
-                content_filters = await database.get_content_filters(key) if key else database.DEFAULT_CONTENT_FILTERS
                 messages_to_send = [msg for msg in messages_to_send if _content_type_allowed(msg, content_filters)]
                 if not messages_to_send:
                     logger.info(f"All messages blocked by content-type filter for {label}")
                     continue
 
-                msg_delay        = await database.get_delay(key) if key else MSG_DELAY
-                endtext          = await database.get_endtext(key) if key else None
-                caption_template = await database.get_caption_template(key) if key else None
-                replace_rules    = await database.get_replacements(key) if key else []
-                remove_words     = await database.get_remove_words(key) if key else []
 
                 sender = source_client
                 if user_id and user_id in active_userbots:
@@ -739,6 +952,7 @@ async def process_buffered_messages(source_chat_id, source_client=None):
                     "replace_rules": replace_rules,
                     "remove_words": remove_words,
                     "forward_tag": content_filters.get("forward_tag", False),
+                    "skip_duplicates": content_filters.get("skip_duplicates", True),
                 }
 
                 await message_queue.put((messages_to_send.copy(), group_targets, "buffered", 0, sender, source_info))
@@ -754,6 +968,10 @@ async def process_buffered_messages(source_chat_id, source_client=None):
         buffer_timers.pop(source_chat_id, None)
     finally:
         buffer_tasks.pop(source_chat_id, None)
+        if restart and message_buffer.get(source_chat_id):
+            buffer_tasks[source_chat_id] = asyncio.create_task(
+                process_buffered_messages(source_chat_id, source_client=source_client)
+            )
 
 
 def _handle_incoming_message(cid: int, message, source_client):

@@ -1289,7 +1289,8 @@ async def _render_customfilters(user_id):
         "🎛", "Content Types",
         "Choose which kinds of messages are forwarded. ✅ = forwarded, ❌ = skipped.",
         quote("<b>Forward Tag</b>\n✅ keeps the “Forwarded from” header (captions and footers cannot change).\n"
-              "❌ sends a clean copy — recommended."),
+              "❌ sends a clean copy — recommended.\n\n"
+              "<b>Skip Duplicates</b>\n✅ the same file coming from another source is not posted again to the same channel."),
         subtitle=await _sub(user_id),
     )
     def toggle(key):
@@ -1299,6 +1300,8 @@ async def _render_customfilters(user_id):
         [toggle("text"), toggle("document")],
         [toggle("video"), toggle("photo")],
         [toggle("audio"), toggle("sticker")],
+        [toggle("voice"), toggle("video_note")],
+        [toggle("animation"), toggle("skip_duplicates")],
         nav(),
     )
     return text, markup
