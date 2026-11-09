@@ -4,3 +4,4 @@ TgCrypto
 uvloop
 motor
 pymongo
+cryptography

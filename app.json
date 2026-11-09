@@ -1,6 +1,6 @@
 {
   "name": "SilentXForwardBot",
-  "description": "A Telegram Bot To Forward Videos And Documents Without Forward Tag.",
+  "description": "A Telegram Bot To Auto-Forward Channel Content Without The Forward Tag.",
   "keywords": [
     "telegram",
     "bot",
@@ -21,17 +21,21 @@
       "description": "Get This Value From @BotFather",
       "required": true
     },
-    "SOURCE_CHANNELS": {
-      "description": "Space Or Comma Separated List Of Source Channel IDs",
-      "required": true
-    },
-    "TARGET_CHANNELS": {
-      "description": "Space Or Comma Separated List Of Target Channel IDs",
-      "required": true
-    },
     "WEB_SERVER": {
       "description": "Enable Web Server For Keep-Alive",
       "value": "True",
+      "required": false
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection string",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram user ID (owner / admin commands)",
+      "required": false
+    },
+    "LOG_CHANNEL": {
+      "description": "Channel ID for bot logs",
       "required": false
     }
   },

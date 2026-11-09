@@ -10,7 +10,9 @@ A Powerful And Efficient Telegram Bot Designed To Forward Videos And Documents F
 ## Features
 
 - **Multi-Source & Multi-Target**: Supports Forwarding From Multiple Source Channels To Multiple Destination Channels.
-- **Content Filtering**: Strictly Forwards Only Videos And Documents. Ignores Text, Photos, Stickers, and GIFs.
+- **Content Filtering**: Per-Channel Toggles For Text, Documents, Videos, Photos, Audio, Voice, Video Notes, GIFs And Stickers.
+- **Duplicate Protection**: Same File (Matched By Telegram's `file_unique_id`) Coming From Two Sources Is Posted Only Once To A Target. Toggle: Settings → Content Types → Skip Duplicates.
+- **Captions & Footer**: Custom Caption Templates, Footer (Also On Text Messages), Replace / Remove Words, Whitelist / Blacklist.
 - **Tag Removal**: Forwards Messages Without The "Forwarded From" Tag.
 - **Instant Delivery**: Optimized Queue Processing For Near-Instant Forwarding.
 - **Flood Wait Handling**: Automatically Handles Telegram's Flood Wait Limits.
@@ -29,6 +31,11 @@ The Bot Is Configured Using .
 | `PORT` | Port For The Web Server. | Optional | `8080` |
 | `TG_WORKERS` | Number Of Pyrogram workers. | Optional | `4` |
 | `APP_URL` | URL Of Your Deployed App (Used For Self-Pinning To Keep Awake). | Yes | `None` |
+| `MONGO_URI` | MongoDB Connection String. | Yes | - |
+| `DB_NAME` | MongoDB Database Name. | Optional | `SilentXBotz` |
+| `OWNER_ID` | Telegram User ID Of The Bot Owner (Admin Commands). | Recommended | `None` |
+| `LOG_CHANNEL` | Channel ID Where Bot Events Are Logged. | Optional | `None` |
+| `FSUB_CHANNELS` | Force-Subscribe Channels (`id:link,id:link`). | Optional | - |
 
 
 ## Deployment
@@ -69,8 +76,8 @@ The Bot Is Configured Using .
    export API_ID=your_api_id
    export API_HASH=your_api_hash
    export BOT_TOKEN=your_bot_token
-   export SOURCE_CHANNELS="-10012345678, -10087654321"
-   export TARGET_CHANNELS="-10011223344, -10055667788"
+   export MONGO_URI=your_mongodb_uri
+   export OWNER_ID=your_telegram_id
    ```
 
 4. **Run the bot:**
